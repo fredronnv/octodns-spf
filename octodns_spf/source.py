@@ -1,15 +1,12 @@
-#
-#
-#
-
 from io import StringIO
 from logging import getLogger
+
+from dns import resolver
 
 from octodns.record import Record, RecordException
 from octodns.source.base import BaseSource
 
 from .processor import SpfDnsLookupProcessor
-
 
 class SpfException(RecordException):
     def __init__(self, msg, record=None):
@@ -19,6 +16,28 @@ class SpfException(RecordException):
         super().__init__(msg)
         self.record = record
 
+def _get_spf_for_domain(domain):
+    """ Helper function to get the full SPF record for a domain """
+    for rdata in resolver.resolve(domain, "TXT"):
+        full_record = ' '.join([r.decode('utf-8') for r in rdata.strings])
+        if full_record.split()[0] == 'v=spf1':
+            return full_record
+    raise SpfException(f'No SPF found for domain: "{domain}", record "{full_record}"')
+
+def _relevant_unpack_records(list):
+    """ Filter relevant records """
+    lookfor = [ "ip4", "ip6", "include" ]
+    return [x for x in list if x.split(':', 1)[0] in lookfor]
+
+def _unpack_include(domain):
+    """ Helper function to unpack SPF_record, is recursive """
+    pieces = _get_spf_for_domain(domain).split()
+    if pieces[0] != 'v=spf1':
+        raise SpfException(f'Unrecognized SPF value: "{spf_record}"')
+    pieces = _relevant_unpack_records(pieces)
+    return [p for p in pieces if p.split(':', 1)[0] != "include"] + sum([
+            _unpack_include(p) for p in pieces if p.split(':', 1)[0] == "include"
+        ],[])
 
 def _parse_spf(value):
     a_records = []
@@ -72,6 +91,7 @@ def _build_spf(
     includes,
     exists,
     soft_fail,
+    unpack_includes,
 ):
     buf = StringIO()
     buf.write('v=spf1')
@@ -93,7 +113,10 @@ def _build_spf(
             buf.write(ip6_address)
     if includes:
         for include in includes:
-            buf.write(' include:')
+            if unpack_includes:
+                include = ' ' + ' '.join(_unpack_include(include))
+            else:
+                buf.write(' include:')
             buf.write(include)
     if exists:
         for exist in exists:
@@ -128,6 +151,7 @@ def _merge_spf(
     includes,
     exists,
     soft_fail,
+    unpack_includes,
 ):
     (
         parsed_a_records,
@@ -154,6 +178,7 @@ def _merge_spf(
         _merge_and_dedup_preserving_order(parsed_includes, includes),
         _merge_and_dedup_preserving_order(parsed_exists, exists),
         parsed_soft_fail,
+        unpack_includes,
     )
 
 
@@ -176,12 +201,13 @@ class SpfSource(BaseSource):
         exists=[],
         soft_fail=False,
         merging_enabled=False,
+        unpack_includes=False,
         ttl=DEFAULT_TTL,
         verify_dns_lookups=False,
     ):
         self.log = getLogger(f'SpfSource[{id}]')
         self.log.info(
-            '__init__: id=%s, a_records=%s, mx_records=%s, ip4_addresses=%s, ip6_addresses=%s, includes=%s, exists=%s, soft_fail=%s, merging_enabled=%s, ttl=%d, verify_dns_lookups=%s',
+            '__init__: id=%s, a_records=%s, mx_records=%s, ip4_addresses=%s, ip6_addresses=%s, includes=%s, exists=%s, soft_fail=%s, merging_enabled=%s, unpack_includes=%s, ttl=%d, verify_dns_lookups=%s',
             id,
             a_records,
             mx_records,
@@ -191,6 +217,7 @@ class SpfSource(BaseSource):
             exists,
             soft_fail,
             merging_enabled,
+            unpack_includes,
             ttl,
             verify_dns_lookups,
         )
@@ -203,6 +230,7 @@ class SpfSource(BaseSource):
         self.exists = exists
 
         self.soft_fail = soft_fail
+        self.unpack_includes = unpack_includes
 
         self.merging_enabled = merging_enabled
         self.ttl = ttl
@@ -215,6 +243,7 @@ class SpfSource(BaseSource):
             includes,
             exists,
             soft_fail,
+            unpack_includes,
         )
         self.log.debug('__init__:   spf=%s', self.spf_value)
 
@@ -272,6 +301,7 @@ class SpfSource(BaseSource):
                     self.includes,
                     self.exists,
                     self.soft_fail,
+                    self.unpack_includes,
                 )
                 self.log.info(
                     'population:   existing value for zone=%s, merging with configured and replacing record',
